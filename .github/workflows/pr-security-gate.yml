@@ -1,0 +1,70 @@
+name: PR security gate
+
+on:
+  pull_request:
+    branches: [staging]
+
+permissions:
+  contents: read
+
+jobs:
+  sbom-gate:                      # this job name is what branch protection will require
+    runs-on: ubuntu-latest
+    env:
+      SYFT_VERSION: "v1.55.0"
+      GRYPE_VERSION: "v0.121.0"
+      CVSS_THRESHOLD: "7.5"
+      MODE: delta                 # delta = new findings only, full = everything
+      ONLY_FIXABLE: "false"
+    steps:
+      - name: Checkout PR (as merged into staging)
+        uses: actions/checkout@v4
+        with:
+          path: pr
+
+      - name: Checkout staging (baseline)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+
+      - name: Install Syft and Grype (pinned)
+        run: |
+          if [[ "$SYFT_VERSION" == "REPLACE_ME" || "$GRYPE_VERSION" == "REPLACE_ME" ]]; then
+            echo "Set SYFT_VERSION and GRYPE_VERSION at the top of this workflow"; exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh"  | sh -s -- -b "$RUNNER_TEMP/bin" "$SYFT_VERSION"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/grype/${GRYPE_VERSION}/install.sh" | sh -s -- -b "$RUNNER_TEMP/bin" "$GRYPE_VERSION"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/syft" version
+          "$RUNNER_TEMP/bin/grype" version
+
+      - name: Generate SBOMs (CycloneDX XML)
+        run: |
+          mkdir -p out
+          syft dir:base -o cyclonedx-xml=out/sbom-base.xml
+          syft dir:pr   -o cyclonedx-xml=out/sbom-pr.xml
+
+      - name: Scan both SBOMs
+        run: |
+          grype sbom:out/sbom-base.xml -o json > out/vulns-base.json
+          grype sbom:out/sbom-pr.xml   -o json > out/vulns-pr.json
+
+      - name: Evaluate gate
+        run: |
+          set +e
+          # Run the script from the trusted staging checkout, not from the PR.
+          python3 base/scripts/sbom_gate.py \
+            out/sbom-base.xml out/sbom-pr.xml out/vulns-base.json out/vulns-pr.json \
+            > out/gate-report.md
+          rc=$?
+          cat out/gate-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Upload SBOMs and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-and-vuln-reports
+          path: out/
